@@ -1,0 +1,13 @@
+#!/bin/bash
+# ytdwn-music - Music Player TUI
+# Plays downloaded music in background
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")" && pwd)"
+cd "$SCRIPT_DIR" || exit 1
+
+if [ ! -d ".venv" ]; then
+    echo "❌ Virtual environment not found."
+    exit 1
+fi
+
+.venv/bin/python music_player.py
