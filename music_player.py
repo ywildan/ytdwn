@@ -45,6 +45,13 @@ class MusicPlayer:
         self.position = 0
         self.is_playing = False
         self.is_paused = False
+        self._track_ended = False
+
+        # Register EOF callback
+        @self.player.event_callback('end-file')
+        def on_end_file(event):
+            if not self.is_paused and self.is_playing:
+                self._track_ended = True
 
     def load_folder(self, folder: Path):
         """Load all audio files from folder recursively."""
@@ -54,6 +61,43 @@ class MusicPlayer:
                 path = Path(root) / f
                 if path.suffix.lower() in AUDIO_EXTS:
                     self.playlist.append(path)
+
+    def save_order(self):
+        """Save current playlist order to file."""
+        order_file = HOME / ".local/share/youtube-downloader/playlist_order.txt"
+        order_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(order_file, "w") as f:
+            for track in self.playlist:
+                f.write(str(track) + "\n")
+
+    def load_order(self, folder: Path) -> bool:
+        """Load saved playlist order. Returns True if loaded successfully."""
+        order_file = HOME / ".local/share/youtube-downloader/playlist_order.txt"
+        if not order_file.exists():
+            return False
+
+        with open(order_file, "r") as f:
+            saved_paths = [line.strip() for line in f if line.strip()]
+
+        # Build new playlist from saved order (only include files that still exist)
+        new_playlist = []
+        for path_str in saved_paths:
+            path = Path(path_str)
+            if path.exists() and path.suffix.lower() in AUDIO_EXTS:
+                new_playlist.append(path)
+
+        # Add any new files not in saved order
+        existing_paths = set(str(p) for p in new_playlist)
+        for root, dirs, files in os.walk(folder):
+            for f in sorted(files):
+                path = Path(root) / f
+                if path.suffix.lower() in AUDIO_EXTS and str(path) not in existing_paths:
+                    new_playlist.append(path)
+
+        if new_playlist:
+            self.playlist = new_playlist
+            return True
+        return False
 
     def move_track(self, from_index: int, to_index: int):
         """Swap track from one position with another."""
@@ -109,6 +153,7 @@ class MusicPlayer:
         if not self.playlist or index < 0 or index >= len(self.playlist):
             return
         self.current_index = index
+        self._track_ended = False  # Reset end flag
         self.player.play(str(self.playlist[index]))
         self.player.pause = False
         self.is_playing = True
@@ -131,6 +176,10 @@ class MusicPlayer:
         """Play next track."""
         if self.current_index + 1 < len(self.playlist):
             self.play(self.current_index + 1)
+        else:
+            # Reached end of playlist
+            self.is_playing = False
+            self.is_paused = False
 
     def prev_track(self):
         """Play previous track."""
@@ -160,8 +209,14 @@ class MusicPlayer:
             if self.is_playing:
                 self.position = self.player.time_pos or 0
                 self.duration = self.player.duration or 0
-                # Check if track ended
-                if self.player.eof_reached and not self.is_paused:
+
+                # Check if track ended using flag set by event callback
+                if self._track_ended:
+                    self._track_ended = False
+                    self.next_track()
+
+                # Fallback: also check eof_reached property
+                if not self.is_paused and self.player.eof_reached:
                     self.next_track()
         except Exception:
             pass
@@ -321,7 +376,9 @@ class MusicApp(App):
     def __init__(self, start_path: Path = DEFAULT_DIR):
         super().__init__()
         self.music = MusicPlayer()
-        self.music.load_folder(start_path)
+        # Try to load saved order first
+        if not self.music.load_order(start_path):
+            self.music.load_folder(start_path)
         self.selected_row = 0
         # Drag state
         self.dragging = False
@@ -394,6 +451,9 @@ class MusicApp(App):
         # Restore cursor position
         if highlight_row >= 0 and highlight_row < len(self.music.playlist):
             table.cursor_cell = (highlight_row, 3)  # Column 3 = Title
+
+        # Save order after any modification
+        self.music.save_order()
 
     def _update_position(self):
         """Update progress bar and time label."""
