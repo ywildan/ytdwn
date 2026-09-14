@@ -1,15 +1,50 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ytdwn - YouTube Downloader TUI
-# Jalankan ini dari terminal mana saja
+# Run from any directory
 
+set -euo pipefail
+
+# Get the absolute path of this script
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
-cd "$SCRIPT_DIR" || exit 1
 
+# Change to project directory
+cd "$SCRIPT_DIR" || {
+    echo "❌ Failed to change to project directory: $SCRIPT_DIR"
+    exit 1
+}
+
+# Check for virtual environment
 if [ ! -d ".venv" ]; then
-    echo "❌ Virtual environment tidak ditemukan. Jalankan setup dulu:"
-    echo "   cd $SCRIPT_DIR && python3 -m venv .venv && .venv/bin/pip install textual"
+    echo "❌ Virtual environment not found."
+    echo ""
+    echo "To set up the environment, run:"
+    echo "  cd $SCRIPT_DIR"
+    echo "  python3 -m venv .venv"
+    echo "  .venv/bin/pip install textual python-mpv"
     exit 1
 fi
 
-.venv/bin/python tui.py
+# Check for Python executable
+if [ ! -x ".venv/bin/python" ]; then
+    echo "❌ Python executable not found in .venv/bin/python"
+    echo "Try recreating the virtual environment:"
+    echo "  rm -rf .venv && python3 -m venv .venv && .venv/bin/pip install textual python-mpv"
+    exit 1
+fi
+
+# Check for entry file
+if [ ! -f "tui.py" ]; then
+    echo "❌ Entry file 'tui.py' not found in $SCRIPT_DIR"
+    exit 1
+fi
+
+# Check for yt-dlp (optional warning)
+if ! command -v yt-dlp >/dev/null 2>&1 && ! .venv/bin/python -c "import yt_dlp" 2>/dev/null; then
+    echo "⚠️  yt-dlp not found in system PATH or venv."
+    echo "   Install with: pip install yt-dlp  (or system package manager)"
+    echo ""
+fi
+
+# Run the TUI
+exec .venv/bin/python tui.py "$@"

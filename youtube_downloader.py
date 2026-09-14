@@ -7,9 +7,13 @@ import os
 import re
 from pathlib import Path
 
-HOME = Path.home()
-DEFAULT_DIR = HOME / "Downloads" / "youtube-dl"
+from config import get_download_dir, ensure_config_dir
+
+DEFAULT_DIR = get_download_dir()
 DEFAULT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Ensure config directory exists
+ensure_config_dir()
 
 YTDLP = "yt-dlp"
 
@@ -45,8 +49,15 @@ def get_video_title(url: str) -> str:
         return "output"
 
 
+PROGRESS_MARKER = "YTDWN_PROGRESS|"
+
+
 def build_cmd(url: str, mode: str, quality: str, output_dir: Path, playlist: bool = False) -> list[str]:
-    cmd = [YTDLP, "--no-warnings", "--progress", "--newline"]
+    cmd = [YTDLP, "--no-warnings", "--newline"]
+
+    # Use progress template with custom marker for reliable parsing
+    # download: is a type selector, not literal output. We embed our own marker.
+    cmd += ["--progress-template", f"download:{PROGRESS_MARKER}%(progress._percent_str)s|%(progress._eta_str)s|%(progress._speed_str)s"]
 
     if playlist:
         cmd += ["--yes-playlist"]
@@ -93,13 +104,37 @@ def download(url: str, mode: str, quality: str, output_dir: Path) -> bool:
         q_label = {"0": "Best (320kbps)", "2": "Good (192kbps)", "5": "Medium (128kbps)", "7": "Low (64kbps)"}.get(quality, quality)
         print(f"  Quality: {q_label}")
     else:
-        print(f"  Quality: {quality.capitalize()}p")
+        q_label = {"best": "Best", "1080": "1080p", "720": "720p", "480": "480p"}.get(quality, quality)
+        print(f"  Quality: {q_label}")
     print(f"  Output : {output_dir}")
     print(f"{'='*50}\n")
 
     try:
-        result = subprocess.run(cmd)
-        return result.returncode == 0
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        # Pattern: YTDWN_PROGRESS|<pct>%|<eta>|<speed>
+        # _percent_str may have leading whitespace, e.g. "  0.0%" or " 12.4%"
+        progress_pattern = re.compile(rf'{re.escape(PROGRESS_MARKER)}(\s*\d+\.?\d*)%\|([^|]*)\|([^|]*)')
+
+        for line in process.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+
+            match = progress_pattern.search(line)
+            if match:
+                pct_str, eta, speed = match.groups()
+                try:
+                    pct = float(pct_str.strip())
+                    if 0 <= pct <= 100:
+                        print(f"\r  Progress: {pct:.1f}% | ETA: {eta} | Speed: {speed}", end="", flush=True)
+                except ValueError:
+                    pass
+            else:
+                print(f"  {line}")
+
+        process.wait()
+        print()  # Newline after progress
+        return process.returncode == 0
     except KeyboardInterrupt:
         print("\n\n⛔ Dibatalkan oleh user.")
         return False

@@ -13,7 +13,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, ScrollableContainer, Container
 from textual.screen import ModalScreen, Screen
 from textual.widgets import (
-    Button, Header, Footer, Input, Select, Static, ProgressBar,
+    Button, Header, Footer, Input, Select, Static,
     Markdown, DataTable, Log, Rule, Label, ListView, ListItem, Tabs, Tab,
 )
 from textual import work, on
@@ -21,12 +21,20 @@ from textual.reactive import reactive
 from textual.color import Color
 from rich.text import Text
 
+from config import get_download_dir, get_music_dir, ensure_config_dir
+
 HOME = Path.home()
-DEFAULT_DIR = HOME / "Downloads" / "youtube-dl"
+DEFAULT_DIR = get_download_dir()
 DEFAULT_DIR.mkdir(parents=True, exist_ok=True)
+
+MUSIC_DIR = get_music_dir()
+MUSIC_DIR.mkdir(parents=True, exist_ok=True)
 
 HISTORY_FILE = HOME / ".local/share/youtube-downloader/history.txt"
 HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+# Ensure config directory exists
+ensure_config_dir()
 
 YTDLP = "yt-dlp"
 
@@ -108,8 +116,7 @@ class InlineDownloadScreen(Screen):
             Static("", id="dl-title", classes="dl-title"),
             Static("", id="dl-meta", classes="dl-meta"),
             Rule(),
-            ProgressBar(total=100, show_eta=True, id="dl-progress"),
-            Static("", id="dl-percent", classes="dl-percent"),
+            Static("", id="dl-progress-text", classes="dl-progress-text"),
             Rule(),
             Log(id="dl-log", auto_scroll=True, classes="dl-log"),
             Rule(),
@@ -136,16 +143,19 @@ class InlineDownloadScreen(Screen):
     async def download_job(self):
         cmd = self._build_cmd()
         log_widget = self.query_one("#dl-log", Log)
-        progress_widget = self.query_one("#dl-progress", ProgressBar)
-        percent_widget = self.query_one("#dl-percent", Static)
+        progress_text = self.query_one("#dl-progress-text", Static)
 
         log_widget.write_line(f"💿 Starting download...")
         log_widget.write_line(f"📁 Output: {self.output_dir}")
         log_widget.write_line("─" * 40)
 
         # Start at 0%
-        progress_widget.update(progress=0)
-        percent_widget.update("0.0%")
+        progress_text.update("0.0%  •  —  •  ETA --:--")
+
+        # Progress regex: YTDWN_PROGRESS|<pct>%|<eta>|<speed>
+        # _percent_str may have leading whitespace, e.g. "  0.0%" or " 12.4%"
+        from youtube_downloader import PROGRESS_MARKER
+        progress_pattern = re.compile(rf'{re.escape(PROGRESS_MARKER)}(\s*\d+\.?\d*)%\|([^|]*)\|([^|]*)')
 
         try:
             self.process = await asyncio.create_subprocess_exec(
@@ -159,17 +169,15 @@ class InlineDownloadScreen(Screen):
                     continue
                 log_widget.write_line(line_str)
 
-                # Parse progress: find "XX.X%" pattern
-                if "[download]" in line_str and "%" in line_str:
+                # Parse structured progress from template
+                match = progress_pattern.search(line_str)
+                if match:
+                    pct_str, eta, speed = match.groups()
                     try:
-                        # Look for pattern like "12.3%" anywhere in line
-                        import re as _re
-                        match = _re.search(r'(\d+\.?\d*)%', line_str)
-                        if match:
-                            pct = float(match.group(1))
-                            if 0 <= pct <= 100:
-                                progress_widget.update(progress=pct)
-                                percent_widget.update(f"{pct:.1f}%")
+                        pct = float(pct_str.strip())
+                        if 0 <= pct <= 100:
+                            # Compact format: "1.2%  •  37.56 KiB/s  •  ETA 02:47"
+                            progress_text.update(f"{pct:.1f}%  •  {speed}  •  ETA {eta}")
                     except (ValueError, IndexError):
                         pass
 
@@ -182,8 +190,7 @@ class InlineDownloadScreen(Screen):
                 self._save_history("cancelled")
             elif self.process.returncode == 0:
                 self.success = True
-                progress_widget.update(progress=100)
-                percent_widget.update("100.0%")
+                progress_text.update("100.0%  •  Done")
                 log_widget.write_line(f"\n✅ Done in {elapsed:.1f}s")
                 self.query_one("#dl-status-icon", Static).update("✅ COMPLETE")
                 self._save_history("done")
@@ -216,6 +223,12 @@ class InlineDownloadScreen(Screen):
 
     def _build_cmd(self):
         cmd = [YTDLP, "--newline"]
+
+        # Use progress template with custom marker for reliable parsing
+        # download: is a type selector, not literal output. We embed our own marker.
+        from youtube_downloader import PROGRESS_MARKER
+        cmd += ["--progress-template", f"download:{PROGRESS_MARKER}%(progress._percent_str)s|%(progress._eta_str)s|%(progress._speed_str)s"]
+
         if self.is_playlist:
             cmd += ["--yes-playlist"]
         else:
@@ -438,16 +451,11 @@ class DownloadApp(App):
         padding: 0 0 1 0;
     }
 
-    #dl-progress {
-        margin: 1 0;
-        border: tall $surface;
-    }
-
-    .dl-percent {
+    .dl-progress-text {
         text-align: center;
         text-style: bold;
         color: $accent;
-        padding: 0 0 1 0;
+        padding: 1 0;
     }
 
     .dl-log {
@@ -491,6 +499,10 @@ class DownloadApp(App):
     detected_type = reactive("")
     detected_count = reactive(0)
     detected_title = reactive("")
+
+    # Debounced metadata detection
+    _metadata_request_id = 0
+    _metadata_timer = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -582,10 +594,21 @@ class DownloadApp(App):
             table.add_row(when, f"{mode_icon} {entry[1]}", status_text, title)
 
     def watch_url_text(self, value):
+        # Guard against early initialization before screen is composed
+        try:
+            self.query_one("#info-box", Static)
+        except Exception:
+            return
+        
         if value and re.match(r"https?://(www\.)?(youtube\.com|youtu\.be)", value):
-            self._detect_url(value)
+            # Immediate local validation - enable download button
+            self.query_one("#info-box", Static).update("✓ Valid YouTube URL")
+            # Debounce metadata fetch
+            self._schedule_metadata_fetch(value)
         elif not value:
             self.query_one("#info-box", Static).update("")
+            self.detected_count = 0
+            self.detected_title = ""
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "url-input":
@@ -593,32 +616,69 @@ class DownloadApp(App):
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "url-input":
-            self._detect_url(event.value)
+            # On submit, also trigger immediate metadata fetch (but debounced)
+            if event.value:
+                self._schedule_metadata_fetch(event.value)
 
-    def _detect_url(self, url: str):
+    def _schedule_metadata_fetch(self, url: str):
+        """Schedule metadata fetch with debouncing."""
+        # Cancel any pending timer
+        if self._metadata_timer:
+            self._metadata_timer.stop()
+        
+        # Increment request ID to invalidate stale workers
+        self._metadata_request_id += 1
+        request_id = self._metadata_request_id
+        
+        # Debounce: wait 300ms before starting metadata fetch
+        self._metadata_timer = self.set_timer(0.3, lambda: self._fetch_metadata_async(url, request_id))
+
+    @work(thread=True, exclusive=False)
+    def _fetch_metadata_async(self, url: str, request_id: int):
+        """Fetch metadata in background thread. Only applies results if request_id is still current."""
         if not url:
             return
-        self.query_one("#info-box", Static).update("⏳ Checking URL...")
-
+        
+        # Check if this request is still the latest
+        if request_id != self._metadata_request_id:
+            return  # Stale request, discard results
+        
         try:
-            if is_playlist(url):
+            is_pl = is_playlist(url)
+            if is_pl:
                 count, title = get_playlist_info(url)
-                self.detected_count = count or 0
-                self.detected_title = title
-                self.query_one("#info-box", Static).update(
-                    f"📋 Playlist Detected\n"
-                    f"   Title: {title or 'Unknown'}\n"
-                    f"   Videos: {count or '?'}"
-                )
+                # Use call_from_thread to update UI from background thread
+                self.call_from_thread(self._update_metadata_ui, request_id, True, count or 0, title or "")
             else:
                 title = get_video_title(url)
-                self.detected_title = title
-                self.query_one("#info-box", Static).update(
-                    f"🎬 Single Video\n"
-                    f"   Title: {title}"
-                )
+                self.call_from_thread(self._update_metadata_ui, request_id, False, 0, title or "")
         except Exception as e:
-            self.query_one("#info-box", Static).update(f"⚠️ Error: {e}")
+            self.call_from_thread(self._update_metadata_ui, request_id, False, 0, "", str(e))
+
+    def _update_metadata_ui(self, request_id: int, is_playlist: bool, count: int, title: str, error: str = ""):
+        """Update UI with metadata results. Only applies if request_id is current."""
+        if request_id != self._metadata_request_id:
+            return  # Stale result, ignore
+        
+        if error:
+            self.query_one("#info-box", Static).update(f"⚠️ Error: {error}")
+            return
+        
+        if is_playlist:
+            self.detected_count = count
+            self.detected_title = title
+            self.query_one("#info-box", Static).update(
+                f"📋 Playlist Detected\n"
+                f"   Title: {title or 'Unknown'}\n"
+                f"   Videos: {count or '?'}"
+            )
+        else:
+            self.detected_count = 0
+            self.detected_title = title
+            self.query_one("#info-box", Static).update(
+                f"🎬 Single Video\n"
+                f"   Title: {title}"
+            )
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "type-select":
@@ -632,33 +692,83 @@ class DownloadApp(App):
         elif event.button.id == "clear-btn":
             self.action_clear()
 
-    def action_paste_clipboard(self):
-        """Paste from clipboard (wl-paste for Wayland)."""
-        try:
-            # Try wl-paste first (Wayland)
-            result = subprocess.run(
-                ["wl-paste", "--no-newline"],
-                capture_output=True, text=True, timeout=5
-            )
-            if result.returncode == 0:
-                clipboard_text = result.stdout.strip()
-            else:
-                # Fallback to xclip (X11)
+    def _get_clipboard_text(self) -> str:
+        """Get clipboard text using platform-appropriate method."""
+        import sys
+        platform = sys.platform
+
+        # Linux Wayland
+        if platform.startswith("linux"):
+            # Try wl-paste (Wayland)
+            try:
+                result = subprocess.run(
+                    ["wl-paste", "--no-newline"],
+                    capture_output=True, text=True, timeout=3
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    return result.stdout.strip()
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+
+            # Try xclip (X11)
+            try:
                 result = subprocess.run(
                     ["xclip", "-selection", "clipboard", "-o"],
-                    capture_output=True, text=True, timeout=5
+                    capture_output=True, text=True, timeout=3
                 )
-                clipboard_text = result.stdout.strip() if result.returncode == 0 else ""
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            clipboard_text = ""
+                if result.returncode == 0 and result.stdout.strip():
+                    return result.stdout.strip()
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+
+            # Try xsel (X11 alternative)
+            try:
+                result = subprocess.run(
+                    ["xsel", "--clipboard", "--output"],
+                    capture_output=True, text=True, timeout=3
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    return result.stdout.strip()
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+
+        # macOS
+        elif platform == "darwin":
+            try:
+                result = subprocess.run(
+                    ["pbpaste"],
+                    capture_output=True, text=True, timeout=3
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    return result.stdout.strip()
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+
+        # Windows
+        elif platform == "win32":
+            try:
+                result = subprocess.run(
+                    ["powershell", "-command", "Get-Clipboard"],
+                    capture_output=True, text=True, timeout=3
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    return result.stdout.strip()
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+
+        return ""
+
+    def action_paste_clipboard(self):
+        """Paste from clipboard (cross-platform)."""
+        clipboard_text = self._get_clipboard_text()
 
         if clipboard_text:
             self.query_one("#url-input", Input).value = clipboard_text
             self.url_text = clipboard_text
             self.query_one("#status-text", Static).update("📋 Pasted from clipboard")
-            self._detect_url(clipboard_text)
+            # The watch_url_text will trigger debounced metadata fetch
         else:
-            self.query_one("#status-text", Static).update("⚠️ Clipboard is empty or not available")
+            self.query_one("#status-text", Static).update("⚠️ Clipboard is empty or not available (no clipboard tool found)")
 
     def action_go_back(self):
         """Go back to previous screen or clear form."""
@@ -702,10 +812,8 @@ class DownloadApp(App):
         is_pl = is_playlist(url)
         count = self.detected_count if is_pl else 0
 
-        # Get actual video title for history and display
-        video_title = ""
-        if not is_pl:
-            video_title = get_video_title(url)
+        # Use already-detected title if available, otherwise download screen will fetch it
+        video_title = self.detected_title if not is_pl and self.detected_title else ""
 
         self.push_screen(
             InlineDownloadScreen(

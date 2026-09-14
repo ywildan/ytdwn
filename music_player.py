@@ -23,11 +23,20 @@ except ImportError:
     print("❌ python-mpv not found. Install with: pip install python-mpv")
     sys.exit(1)
 
+from config import get_download_dir, get_music_dir, ensure_config_dir
+
 HOME = Path.home()
-DEFAULT_DIR = HOME / "Downloads" / "youtube-dl"
+DEFAULT_DIR = get_download_dir()
+DEFAULT_DIR.mkdir(parents=True, exist_ok=True)
+
+MUSIC_DIR = get_music_dir()
+MUSIC_DIR.mkdir(parents=True, exist_ok=True)
 
 # Extensions to scan
 AUDIO_EXTS = {'.mp3', '.m4a', '.webm', '.ogg', '.opus', '.flac', '.wav'}
+
+# Ensure config directory exists
+ensure_config_dir()
 
 
 class MusicPlayer:
@@ -211,13 +220,18 @@ class MusicPlayer:
                 self.duration = self.player.duration or 0
 
                 # Check if track ended using flag set by event callback
+                # This is the authoritative mechanism - event callback sets _track_ended
                 if self._track_ended:
                     self._track_ended = False
                     self.next_track()
+                    return  # Prevent fallback from also triggering
 
-                # Fallback: also check eof_reached property
+                # Fallback: only check eof_reached if event callback didn't fire
+                # This handles cases where the event callback might be missed
                 if not self.is_paused and self.player.eof_reached:
-                    self.next_track()
+                    # Additional guard: only trigger if position is at or near duration
+                    if self.duration > 0 and self.position >= self.duration - 1.0:
+                        self.next_track()
         except Exception:
             pass
 
@@ -373,17 +387,40 @@ class MusicApp(App):
         ("x", "remove_track", "Remove"),
     ]
 
-    def __init__(self, start_path: Path = DEFAULT_DIR):
+    def __init__(self, start_path: Path = MUSIC_DIR):
         super().__init__()
         self.music = MusicPlayer()
-        # Try to load saved order first
-        if not self.music.load_order(start_path):
-            self.music.load_folder(start_path)
+        self.start_path = start_path
+        self.folder_error: str | None = None
+
+        # Validate and load music folder
+        self._validate_and_load_folder(start_path)
+
         self.selected_row = 0
         # Drag state
         self.dragging = False
         self.drag_start_row = -1
         self.drag_current_row = -1
+
+    def _validate_and_load_folder(self, folder: Path | str) -> None:
+        """Validate folder and load playlist. Sets self.folder_error if invalid."""
+        folder = Path(folder)
+        self.folder_error = None
+
+        if not folder.exists():
+            self.folder_error = f"Directory not found: {folder}"
+        elif not folder.is_dir():
+            self.folder_error = f"Not a directory: {folder}"
+        elif not os.access(folder, os.R_OK):
+            self.folder_error = f"Cannot read directory (permission denied): {folder}"
+        else:
+            # Try to load saved order first
+            if not self.music.load_order(folder):
+                self.music.load_folder(folder)
+            return
+
+        # If we reach here, there was an error - start with empty playlist
+        self.music.playlist = []
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -426,6 +463,12 @@ class MusicApp(App):
         self._suppress_play = False
         self._load_playlist_table()
         self.query_one("#drag-overlay", Static).display = False
+
+        # Show folder error if validation failed
+        if self.folder_error:
+            self.notify(self.folder_error, title="Music Folder Error", severity="error")
+            self.query_one("#status-text", Static).update(f"⚠️ {self.folder_error}")
+
         # Start position update loop
         self.set_interval(0.5, self._update_position)
 
@@ -508,7 +551,8 @@ class MusicApp(App):
         mouse_y = getattr(event, 'screen_y', event.y)
         if (region.x <= event.screen_x < region.x + region.width and
             region.y <= mouse_y < region.y + region.height):
-            row = int(mouse_y - region.y - 1)
+            # Account for header row (1) and scroll offset
+            row = int(mouse_y - region.y - 1 + table.scroll_y)
             if 0 <= row < len(self.music.playlist):
                 self.dragging = True
                 self.drag_start_row = row
@@ -525,7 +569,8 @@ class MusicApp(App):
         mouse_y = getattr(event, 'screen_y', event.y)
         if (region.x <= event.screen_x < region.x + region.width and
             region.y <= mouse_y < region.y + region.height):
-            row = int(mouse_y - region.y - 1)
+            # Account for header row (1) and scroll offset
+            row = int(mouse_y - region.y - 1 + table.scroll_y)
             if 0 <= row < len(self.music.playlist):
                 self.drag_current_row = row
 
@@ -656,9 +701,15 @@ class MusicApp(App):
             self.notify("Track removed", title="Remove")
 
     def action_rescan(self):
-        self.music.load_folder(DEFAULT_DIR)
+        self._validate_and_load_folder(self.start_path)
         self._load_playlist_table()
-        self.notify(f"Rescanned: {len(self.music.playlist)} tracks", title="Rescan")
+        if self.folder_error:
+            self.notify(self.folder_error, title="Music Folder Error", severity="error")
+            self.query_one("#status-text", Static).update(f"⚠️ {self.folder_error}")
+        else:
+            self.query_one("#status-text", Static).update("")
+            self.notify(f"Rescanned: {len(self.music.playlist)} tracks", title="Rescan")
+        self.sub_title = f"{len(self.music.playlist)} tracks"
 
     def on_quit(self):
         self.music.player.quit()

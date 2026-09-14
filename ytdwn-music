@@ -1,13 +1,51 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ytdwn-music - Music Player TUI
 # Plays downloaded music in background
+# Run from any directory
 
-SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")" && pwd)"
-cd "$SCRIPT_DIR" || exit 1
+set -euo pipefail
 
+# Get the absolute path of this script
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+
+# Change to project directory
+cd "$SCRIPT_DIR" || {
+    echo "❌ Failed to change to project directory: $SCRIPT_DIR"
+    exit 1
+}
+
+# Check for virtual environment
 if [ ! -d ".venv" ]; then
     echo "❌ Virtual environment not found."
+    echo ""
+    echo "To set up the environment, run:"
+    echo "  cd $SCRIPT_DIR"
+    echo "  python3 -m venv .venv"
+    echo "  .venv/bin/pip install textual python-mpv"
     exit 1
 fi
 
-.venv/bin/python music_player.py
+# Check for Python executable
+if [ ! -x ".venv/bin/python" ]; then
+    echo "❌ Python executable not found in .venv/bin/python"
+    echo "Try recreating the virtual environment:"
+    echo "  rm -rf .venv && python3 -m venv .venv && .venv/bin/pip install textual python-mpv"
+    exit 1
+fi
+
+# Check for entry file
+if [ ! -f "music_player.py" ]; then
+    echo "❌ Entry file 'music_player.py' not found in $SCRIPT_DIR"
+    exit 1
+fi
+
+# Check for mpv (optional warning)
+if ! command -v mpv >/dev/null 2>&1; then
+    echo "⚠️  mpv not found in system PATH."
+    echo "   Install with your system package manager (e.g., pacman -S mpv, apt install mpv, brew install mpv)"
+    echo ""
+fi
+
+# Run the music player
+exec .venv/bin/python music_player.py "$@"
